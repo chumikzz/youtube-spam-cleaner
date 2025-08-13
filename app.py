@@ -1,9 +1,11 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
 import unicodedata
 from datetime import datetime
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
@@ -11,6 +13,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
@@ -18,8 +21,9 @@ CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
 CRON_KEY = os.getenv("CRON_KEY", "change-this")
+BAN_AUTHOR = os.getenv("BAN_AUTHOR", "0") in ("1","true","True","yes","on")
+LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "").strip()
 
-# --- corrected scopes ---
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -54,25 +58,24 @@ class Account(Base):
 
 Base.metadata.create_all(engine)
 
-SPAM_PATTERNS = [
-    r"judi\b", r"slot\b", r"togel\b", r"casino\b|kasino\b",
-    r"\bmaxwin\b", r"scatter\b", r"\brtp\b", r"pola\s+gacor",
-    r"bonus\s+new\s+member", r"\bparlay\b",
-    r"\b4d\b|\b3d\b|\b2d\b",
-    r"\bwd\b", r"deposit\b.*(pulsa|e[-\s]?wallet)",
-    r"\bbandar\b|\btaruhan\b|\bbet\b",
-    r"pragmatic|habanero|pg\s*soft",
-    r"(wa|whatsapp)[:\s]*\+?\d{8,}",
-    r"http[s]?://\S+",
-    r"link\s+alternatif",
+# === KEYWORDS-ONLY MATCHING ===
+KEYWORDS = [
+    'pulau', 'pulauwin', 'pluto', 'plut088', 'pluto88', 'probet855',
+    'mona', 'mona4d', 'alexis17', 'soundeffect', 'mudahwin',
+    'akunpro', '혗혜혓혈혜혞혐형', 'maxwin', 'pulau777', 'weton88',
+    'plutowin', 'plutowinn', 'pluto8', 'pulowin', 'pulauw', 'plu88',
+    'pulautoto', 'tempatnyaparapemenangsejatiberkumpul',
+    'bahkandilaguremix', 'bergabunglahdenganpulau777',
+    '퓟퓤퓛퓐퓤퓦퓘퓝', '홿횄홻홰횄횆홸홽'
 ]
-SPAM_REGEX = re.compile("|".join(SPAM_PATTERNS), re.IGNORECASE)
+KEYWORDS = [k.strip() for k in KEYWORDS if k.strip()]
+KEYWORD_REGEX = re.compile("(" + "|".join(re.escape(k) for k in KEYWORDS) + ")", re.IGNORECASE)
 
 def normalize_text(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "")
 
 def is_spam(text: str) -> bool:
-    return bool(SPAM_REGEX.search(normalize_text(text)))
+    return bool(KEYWORD_REGEX.search(normalize_text(text)))
 
 def get_flow():
     if not (CLIENT_ID and CLIENT_SECRET):
@@ -131,8 +134,20 @@ def iter_comments(thread):
     for r in thread.get("replies", {}).get("comments", []):
         yield (r["id"], r["snippet"].get("textDisplay", ""), r["snippet"].get("authorDisplayName", ""), True)
 
-def delete_comment(yt, cid: str):
-    yt.comments().delete(id=cid).execute()
+def remove_comment(yt, cid: str):
+    # Prefer moderation (rejected) -> then markAsSpam -> delete
+    try:
+        yt.comments().setModerationStatus(
+            id=cid, moderationStatus="rejected", banAuthor=bool(BAN_AUTHOR)
+        ).execute()
+        return "rejected"
+    except HttpError:
+        try:
+            yt.comments().markAsSpam(id=cid).execute()
+            return "marked_spam"
+        except HttpError:
+            yt.comments().delete(id=cid).execute()
+            return "deleted"
 
 @app.get("/")
 def index():
@@ -199,6 +214,16 @@ def logout():
     session.clear()
     return redirect(url_for("index"))
 
+def _send_webhook(summary: dict):
+    if not LOG_WEBHOOK_URL:
+        return
+    try:
+        data = json.dumps(summary).encode("utf-8")
+        req = Request(LOG_WEBHOOK_URL, data=data, headers={"Content-Type":"application/json"})
+        urlopen(req, timeout=10)
+    except Exception:
+        pass  # jangan ganggu flow utama
+
 @app.post("/scan")
 def scan_my_channel():
     acc_id = session.get("acc_id")
@@ -209,33 +234,38 @@ def scan_my_channel():
         yt = yt_from_refresh(acc.refresh_token)
 
         flagged = []
-        deleted = 0
+        removed = {"rejected":0, "marked_spam":0, "deleted":0, "errors":0}
         scanned = 0
 
         for thread in list_channel_threads(yt, acc.channel_id):
             for cid, text, author, is_reply in iter_comments(thread):
                 scanned += 1
                 if is_spam(text):
-                    flagged.append({"comment_id": cid, "author": author, "text": text[:200], "is_reply": is_reply})
+                    item = {"comment_id": cid, "author": author, "text": text[:200], "is_reply": is_reply}
                     try:
-                        delete_comment(yt, cid)
-                        deleted += 1
+                        how = remove_comment(yt, cid)
+                        item["action"] = how
+                        removed[how] = removed.get(how, 0) + 1
                     except Exception as e:
-                        flagged[-1]["delete_error"] = str(e)
+                        removed["errors"] += 1
+                        item["delete_error"] = str(e)
+                    flagged.append(item)
 
         summary = {
             "channel_id": acc.channel_id,
             "channel_title": acc.channel_title,
             "scanned": scanned,
             "flagged": len(flagged),
-            "deleted": deleted,
+            **removed,
             "examples": flagged[:10],
             "ts": datetime.utcnow().isoformat() + "Z",
+            "keywords_used": KEYWORDS,
         }
         acc.last_scan_at = datetime.utcnow()
         acc.last_scan_summary = json.dumps(summary)
         db.commit()
 
+    _send_webhook(summary)
     return jsonify(summary)
 
 @app.post("/cron/scan_all")
@@ -248,26 +278,28 @@ def cron_scan_all():
         for acc in db.query(Account).all():
             try:
                 yt = yt_from_refresh(acc.refresh_token)
-                flagged = []
-                deleted = 0
+                flagged = 0
+                removed = {"rejected":0, "marked_spam":0, "deleted":0, "errors":0}
                 scanned = 0
                 for thread in list_channel_threads(yt, acc.channel_id):
                     for cid, text, author, is_reply in iter_comments(thread):
                         scanned += 1
                         if is_spam(text):
-                            flagged.append({"comment_id": cid, "author": author, "text": text[:200], "is_reply": is_reply})
+                            flagged += 1
                             try:
-                                delete_comment(yt, cid)
-                                deleted += 1
+                                how = remove_comment(yt, cid)
+                                removed[how] = removed.get(how, 0) + 1
                             except Exception as e:
-                                flagged[-1]["delete_error"] = str(e)
-                summary = {"channel_id": acc.channel_id, "scanned": scanned, "flagged": len(flagged), "deleted": deleted}
+                                removed["errors"] += 1
+                summary = {"channel_id": acc.channel_id, "scanned": scanned, "flagged": flagged, **removed, "ts": datetime.utcnow().isoformat()+"Z"}
                 acc.last_scan_at = datetime.utcnow()
                 acc.last_scan_summary = json.dumps(summary)
                 db.commit()
                 results.append({"channel_id": acc.channel_id, "ok": True, **summary})
             except Exception as e:
                 results.append({"channel_id": acc.channel_id, "ok": False, "error": str(e)})
+    # kirim ringkasan semua akun ke webhook sekali saja
+    _send_webhook({"type":"scan_all", "results": results, "ts": datetime.utcnow().isoformat()+"Z"})
     return jsonify({"results": results})
 
 @app.get("/health")
