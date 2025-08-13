@@ -19,7 +19,12 @@ CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
 CRON_KEY = os.getenv("CRON_KEY", "change-this")
 
-SCOPES = ["openid","email","https://www.googleapis.com/auth/youtube.force-ssl"]
+# --- corrected scopes ---
+SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+]
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///local.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -34,7 +39,6 @@ app.secret_key = SECRET_KEY
 
 # Trust Railway proxy & prefer HTTPS
 app.config.update(PREFERRED_URL_SCHEME="https", SESSION_COOKIE_SECURE=True)
-# Trust X-Forwarded-Proto and X-Forwarded-Host from Railway
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 class Account(Base):
