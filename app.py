@@ -65,7 +65,7 @@ KEYWORDS = [
     'akunpro', '혗혜혓혈혜혞혐형', 'maxwin', 'pulau777', 'weton88',
     'plutowin', 'plutowinn', 'pluto8', 'pulowin', 'pulauw', 'plu88',
     'pulautoto', 'tempatnyaparapemenangsejatiberkumpul',
-    'bahkandilaguremix', 'bergabunglahdenganpulau777',
+    'doyokjp', 'bergabunglahdenganpulau777',
     '퓟퓤퓛퓐퓤퓦퓘퓝', '홿횄홻홰횄횆홸홽'
 ]
 KEYWORDS = [k.strip() for k in KEYWORDS if k.strip()]
