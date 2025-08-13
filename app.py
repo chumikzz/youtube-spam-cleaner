@@ -4,12 +4,14 @@ import json
 import unicodedata
 from datetime import datetime
 from urllib.parse import urljoin
+
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -29,6 +31,14 @@ Base = declarative_base()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+# --- Trust Railway proxy & prefer HTTPS so oauthlib sees https ---
+app.config.update(
+    PREFERRED_URL_SCHEME="https",
+    SESSION_COOKIE_SECURE=True,
+)
+# Trust X-Forwarded-Proto and X-Forwarded-Host from Railway
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 class Account(Base):
     __tablename__ = "accounts"
@@ -51,18 +61,43 @@ def is_spam(text): return bool(SPAM_REGEX.search(normalize_text(text)))
 def get_flow():
     if not (CLIENT_ID and CLIENT_SECRET):
         raise RuntimeError("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET")
-    redirect_uri = OAUTH_REDIRECT_URI or urljoin(request.url_root, "oauth/callback")
-    config = {"web": {"client_id": CLIENT_ID, "project_id": "youtube-public-bot", "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token", "client_secret": CLIENT_SECRET, "redirect_uris": [redirect_uri], "javascript_origins": [request.host_url.rstrip("/")]}}
+    # Use explicit https base (ProxyFix should already handle this)
+    redirect_uri = OAUTH_REDIRECT_URI or urljoin(request.host_url, "oauth/callback")
+    config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "project_id": "youtube-public-bot",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_secret": CLIENT_SECRET,
+            "redirect_uris": [redirect_uri],
+            "javascript_origins": [request.host_url.rstrip("/")],
+        }
+    }
     return Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
 
 def yt_from_refresh(refresh_token: str):
-    creds = Credentials(None, refresh_token=refresh_token, token_uri="https://oauth2.googleapis.com/token", client_id=CLIENT_ID, client_secret=CLIENT_SECRET, scopes=SCOPES)
+    creds = Credentials(
+        None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        scopes=SCOPES,
+    )
     return build("youtube", "v3", credentials=creds)
 
 def list_channel_threads(yt, channel_id: str, max_threads=300):
     page_token = None; scanned = 0
     while True:
-        resp = yt.commentThreads().list(part="snippet,replies", allThreadsRelatedToChannelId=channel_id, maxResults=100, textFormat="plainText", order="time", pageToken=page_token).execute()
+        resp = yt.commentThreads().list(
+            part="snippet,replies",
+            allThreadsRelatedToChannelId=channel_id,
+            maxResults=100,
+            textFormat="plainText",
+            order="time",
+            pageToken=page_token
+        ).execute()
         for item in resp.get("items", []):
             scanned += 1; yield item
             if scanned >= max_threads: return
@@ -88,7 +123,11 @@ def index():
 @app.get("/auth/login")
 def auth_login():
     flow = get_flow()
-    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
     session["state"] = state
     return redirect(auth_url)
 
