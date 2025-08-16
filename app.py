@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Judiclean (Discord Logging + Debug)
-- Keywords-only filter.
-- Removal order: rejected -> markAsSpam -> delete.
-- Sends scan summary to Discord (embed). Falls back to plain text if embed fails.
-- Includes /debug/ping_webhook and /debug/show_env for troubleshooting.
+Judiclean (Discord Logging + Debug v2)
+- Adds proper headers (User-Agent, Accept) to bypass Cloudflare 1010.
+- Falls back to discordapp.com domain if 403/1010 happens.
+- Includes /debug endpoints to test quickly.
 """
 import os
 import re
@@ -187,7 +186,13 @@ def _discord_embed(summary: dict) -> dict:
 
 def _post_json(url: str, payload: dict) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, headers={"Content-Type":"application/json"})
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        # Browser-like UA to avoid Cloudflare 1010
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36 Judiclean/1.0"
+    }
+    req = Request(url, data=data, headers=headers)
     try:
         with urlopen(req, timeout=10) as r:
             status = r.getcode()
@@ -199,19 +204,31 @@ def _post_json(url: str, payload: dict) -> dict:
         status = 0
         body = str(e)
     if LOG_WEBHOOK_DEBUG:
-        print(f"[WEBHOOK] status={status} body={body[:200]}")
+        print(f"[WEBHOOK] status={status} body-error code: {body[:50]}")
     return {"status": status, "body": body}
 
 def _send_webhook(summary: dict):
     if not LOG_WEBHOOK_URL:
         if LOG_WEBHOOK_DEBUG: print("[WEBHOOK] LOG_WEBHOOK_URL not set")
         return
-    # try embed first
-    resp = _post_json(LOG_WEBHOOK_URL, {"content":"", "embeds":[_discord_embed(summary)], "allowed_mentions":{"parse":[]}})
-    if not (200 <= resp["status"] < 300 or resp["status"] == 204):
-        # fallback to simple text
+    # prefer wait=true for JSON response
+    url = LOG_WEBHOOK_URL
+    if "wait=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}wait=true"
+    # try main domain first
+    resp = _post_json(url, {"content":"", "embeds":[_discord_embed(summary)], "allowed_mentions":{"parse":[]}})
+    # on Cloudflare 403 1010, try alternate discordapp.com domain and plain text fallback
+    if resp["status"] == 403 and "1010" in resp["body"]:
+        alt = url.replace("https://discord.com", "https://discordapp.com")
+        resp2 = _post_json(alt, {"content":"", "embeds":[_discord_embed(summary)], "allowed_mentions":{"parse":[]}})
+        if not (200 <= resp2["status"] < 300 or resp2["status"] == 204):
+            txt = f"Judiclean — {summary.get('channel_title')} | scanned={summary.get('scanned')} flagged={summary.get('flagged')} rejected={summary.get('rejected')} spam={summary.get('marked_spam')} deleted={summary.get('deleted')}"
+            _post_json(alt, {"content": txt, "allowed_mentions": {"parse":[]}})
+    elif not (200 <= resp["status"] < 300 or resp["status"] == 204):
+        # generic fallback if not 403/1010
         txt = f"Judiclean — {summary.get('channel_title')} | scanned={summary.get('scanned')} flagged={summary.get('flagged')} rejected={summary.get('rejected')} spam={summary.get('marked_spam')} deleted={summary.get('deleted')}"
-        _post_json(LOG_WEBHOOK_URL, {"content": txt, "allowed_mentions": {"parse":[]}})
+        _post_json(url, {"content": txt, "allowed_mentions": {"parse":[]}})
 
 @app.get("/")
 def index():
@@ -329,7 +346,7 @@ def debug_ping():
         "keywords_used": KEYWORDS[:5],
     }
     _send_webhook(demo)
-    return jsonify({"ok": True, "sent": True, "demo": demo, "webhook_set": bool(LOG_WEBHOOK_URL)})
+    return jsonify({"ok": True, "sent": True, "webhook_set": bool(LOG_WEBHOOK_URL)})
 
 @app.get("/debug/show_env")
 def debug_env():
