@@ -17,6 +17,11 @@ from urllib.error import HTTPError, URLError
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
+# === imports tambahan untuk SaaS MVP ===
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import relationship
+from cryptography.fernet import Fernet
+import base64, hashlib
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -61,6 +66,57 @@ class Account(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_scan_at = Column(DateTime, nullable=True)
     last_scan_summary = Column(Text, nullable=True)
+# ======== MULTI-USER MODELS (SaaS MVP) ========
+
+def _fernet():
+    # turunkan SECRET_KEY jadi 32 bytes agar valid untuk Fernet
+    key = hashlib.sha256(SECRET_KEY.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, index=True)
+    name = Column(String(255))
+    avatar = Column(String(512))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    connections = relationship("Connection", back_populates="user", cascade="all,delete")
+    settings = relationship("Setting", back_populates="user", uselist=False, cascade="all,delete")
+
+class Connection(Base):
+    __tablename__ = "connections"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    provider = Column(String(32), default="google")
+    channel_id = Column(String(64), index=True)
+    channel_title = Column(String(255))
+    refresh_token_enc = Column(Text)   # disimpan terenkripsi
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_scan_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="connections")
+
+    # helper simpan/ambil token terenkripsi
+    def set_refresh_token(self, token: str):
+        self.refresh_token_enc = _fernet().encrypt(token.encode()).decode()
+
+    def get_refresh_token(self) -> str:
+        return _fernet().decrypt(self.refresh_token_enc.encode()).decode()
+
+class Setting(Base):
+    __tablename__ = "settings"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True)
+    keywords = Column(Text)                          # JSON string list
+    discord_webhook = Column(String(512), nullable=True)
+    ban_author = Column(Integer, default=0)          # 0/1
+    schedule = Column(String(32), default="manual")  # manual/hourly/3h/daily
+    plan = Column(String(32), default="free")        # free/pro/creator/agency
+
+    user = relationship("User", back_populates="settings")
+
+# ======== END MULTI-USER MODELS ========
 
 Base.metadata.create_all(engine)
 
