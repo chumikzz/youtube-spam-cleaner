@@ -411,8 +411,6 @@ def debug_env():
         "LOG_WEBHOOK_DEBUG": LOG_WEBHOOK_DEBUG,
         "BAN_AUTHOR": BAN_AUTHOR,
     })
-
-@app.get("/health")
 # --- debug: lihat tabel di DB ---
 from sqlalchemy import inspect
 
@@ -423,6 +421,8 @@ def debug_db_tables():
         return jsonify({"tables": insp.get_table_names()}), 200
     except Exception as e:
         return jsonify({"error": type(e).__name__, "message": str(e)}), 500
+
+@app.get("/health")
 def health():
     return jsonify({"ok": True})
 
