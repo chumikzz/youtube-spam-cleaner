@@ -413,6 +413,16 @@ def debug_env():
     })
 
 @app.get("/health")
+# --- debug: lihat tabel di DB ---
+from sqlalchemy import inspect
+
+@app.route("/debug/db_tables", methods=["GET"])
+def debug_db_tables():
+    try:
+        insp = inspect(engine)
+        return jsonify({"tables": insp.get_table_names()}), 200
+    except Exception as e:
+        return jsonify({"error": type(e).__name__, "message": str(e)}), 500
 def health():
     return jsonify({"ok": True})
 
