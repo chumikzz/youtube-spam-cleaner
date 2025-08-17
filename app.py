@@ -119,6 +119,21 @@ class Setting(Base):
 # ======== END MULTI-USER MODELS ========
 
 Base.metadata.create_all(engine)
+# imports tambahan
+from functools import wraps
+
+def db():
+    """Dapatkan sesi DB baru dari SessionLocal."""
+    return SessionLocal()
+
+def login_required(fn):
+    """Proteksi route: wajib sudah login (punya session['uid'])."""
+    @wraps(fn)
+    def _wrap(*a, **kw):
+        if "uid" not in session:
+            return redirect(url_for("index"))  # ganti 'index' kalau nama view-mu beda
+        return fn(*a, **kw)
+    return _wrap
 
 KEYWORDS = [
     'pulau', 'pulauwin', 'pluto', 'plut088', 'pluto88', 'probet855',
