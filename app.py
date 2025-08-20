@@ -362,21 +362,31 @@ def logout():
     return redirect(url_for("index"))
 
 @app.post("/scan")
+@login_required
 def scan_my_channel():
-    acc_id = session.get("acc_id")
-    if not acc_id:
-        return jsonify({"error": "Not logged in"}), 401
+    acc_id = session["acc_id"]  # sudah dijamin ada oleh @login_required
+
     with SessionLocal() as db:
         acc = db.get(Account, acc_id)
+        if not acc:
+            return jsonify({"error": "Account not found"}), 404
+
         yt = yt_from_refresh(acc.refresh_token)
+
         flagged = []
-        removed = {"rejected":0, "marked_spam":0, "deleted":0, "errors":0}
+        removed = {"rejected": 0, "marked_spam": 0, "deleted": 0, "errors": 0}
         scanned = 0
+
         for thread in list_channel_threads(yt, acc.channel_id):
             for cid, text, author, is_reply in iter_comments(thread):
                 scanned += 1
                 if is_spam(text):
-                    item = {"comment_id": cid, "author": author, "text": text[:200], "is_reply": is_reply}
+                    item = {
+                        "comment_id": cid,
+                        "author": author,
+                        "text": text[:200],
+                        "is_reply": is_reply,
+                    }
                     try:
                         how = remove_comment(yt, cid)
                         item["action"] = how
@@ -385,6 +395,7 @@ def scan_my_channel():
                         removed["errors"] += 1
                         item["delete_error"] = str(e)
                     flagged.append(item)
+
         summary = {
             "channel_id": acc.channel_id,
             "channel_title": acc.channel_title,
@@ -395,10 +406,15 @@ def scan_my_channel():
             "ts": datetime.utcnow().isoformat() + "Z",
             "keywords_used": KEYWORDS,
         }
+
+        # simpan hasil scan ke DB
         acc.last_scan_at = datetime.utcnow()
         acc.last_scan_summary = json.dumps(summary)
         db.commit()
+
+    # (opsional) kirim notifikasi ke Discord
     _send_webhook(summary)
+
     return jsonify(summary)
 
 @app.get("/debug/ping_webhook")
