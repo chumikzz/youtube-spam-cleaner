@@ -7,24 +7,84 @@
   <style>
     body{font-family:Inter,system-ui,Arial;margin:0;background:#0b0f14;color:#e6edf3}
     .wrap{max-width:820px;margin:40px auto;padding:0 16px}
-    .card{background:#121923;border:1px solid #263041;border-radius:16px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
-    button{padding:10px 14px;border-radius:10px;background:#2b6ef6;color:#fff;border:0;cursor:pointer}
-    pre{white-space:pre-wrap;background:#0b1220;border:1px solid #223148;border-radius:12px;padding:12px}
+    .card{background:#141b23;border:1px solid #263041;border-radius:12px;padding:24px;
+          box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    h1{margin:0 0 16px 0}
     .muted{opacity:.85}
+    .btn{display:inline-block;padding:10px 14px;border-radius:8px;border:0;cursor:pointer}
+    .btn-primary{background:#2b6ef6;color:#fff}
+    .btn-secondary{background:#3b4450;color:#fff}
+    .btn[disabled]{opacity:.6;cursor:not-allowed}
+    pre{white-space:pre-wrap;background:#0d1218;border:1px solid #223148;border-radius:8px;padding:12px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <h1>Judiclean — Dashboard</h1>
-      <p class="muted">Channel: <strong>{{acc.channel_title}}</strong> ({{acc.channel_id}})</p>
-      {% if acc.last_scan_at %}<p>Scan terakhir: {{acc.last_scan_at}} UTC</p>{% endif %}
-      {% if acc.last_scan_summary %}<pre>{{acc.last_scan_summary}}</pre>{% endif %}
-      <form method="post" action="/scan"><button type="submit">Scan & Hapus Sekarang</button></form>
-      <form method="post" action="/logout" style="margin-top:12px">
-        <button type="submit" style="background:#3b4452">Logout</button>
-      </form>
+
+      <p class="muted">
+        Channel: <strong>{{ acc.channel_title }}</strong> ({{ acc.channel_id }})
+      </p>
+
+      <p class="muted">
+        {% if acc.last_scan_at %}
+          Scan terakhir: {{ acc.last_scan_at }} UTC
+        {% else %}
+          Belum ada riwayat scan.
+        {% endif %}
+      </p>
+
+      <!-- Hasil scan ditampilkan di sini -->
+      {% if last %}
+        <pre id="last-json">{{ last | tojson(indent=2) }}</pre>
+      {% else %}
+        <pre id="last-json">{}</pre>
+      {% endif %}
+
+      <div class="row" style="margin-top:12px">
+        <!-- Tombol scan: AJAX -->
+        <button id="scanBtn" type="button" class="btn btn-primary">Scan &amp; Hapus Sekarang</button>
+
+        <!-- Logout tetap pakai POST form -->
+        <form method="post" action="/logout">
+          <button type="submit" class="btn btn-secondary">Logout</button>
+        </form>
+      </div>
     </div>
   </div>
+
+  <script>
+    const btn = document.getElementById('scanBtn');
+    const out = document.getElementById('last-json');
+
+    async function doScan() {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Scanning…';
+
+      try {
+        const res = await fetch('/scan', {
+          method: 'POST',
+          headers: { 'Accept': 'application/json' }
+        });
+
+        const text = await res.text();            // ambil mentah untuk debugging
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}\n${text}`);
+
+        let data;
+        try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        out.textContent = 'Gagal scan: ' + err.message;
+      } finally {
+        btn.textContent = original;
+        btn.disabled = false;
+      }
+    }
+
+    if (btn) btn.addEventListener('click', doScan);
+  </script>
 </body>
 </html>
