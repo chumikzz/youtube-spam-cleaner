@@ -144,6 +144,12 @@ KEYWORDS = [
     '퓟퓤퓛퓐퓤퓦퓘퓝', '홿횄홻홰횄횆홸홽'
 ]
 KEYWORD_REGEX = re.compile("(" + "|".join(re.escape(k) for k in KEYWORDS) + ")", re.IGNORECASE)
+EXTRA_KEYWORDS = [k.strip() for k in os.getenv("EXTRA_KEYWORDS", "").split(",") if k.strip()]
+# gabungkan & hilangkan duplikat sambil mempertahankan urutan
+KEYWORDS = list(dict.fromkeys(KEYWORDS + EXTRA_KEYWORDS))
+
+# rebuild regex setelah KEYWORDS final
+KEYWORD_REGEX = re.compile("(" + "|".join(re.escape(k) for k in KEYWORDS) + ")", re.IGNORECASE)
 
 def normalize_text(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "")
@@ -481,6 +487,14 @@ def debug_db_tables():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+    
+@app.get("/debug/keywords")
+def debug_keywords():
+    return jsonify({
+        "count": len(KEYWORDS),
+        "keywords": KEYWORDS[:200]  # batasi output
+    })
+
 
 # ========= dev server =========
 if __name__ == "__main__":
