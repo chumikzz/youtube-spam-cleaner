@@ -15,7 +15,10 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, inspect
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime, Text,
+    ForeignKey, inspect, select
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from cryptography.fernet import Fernet
 import base64, hashlib
@@ -70,7 +73,7 @@ class Account(Base):
     last_scan_at = Column(DateTime, nullable=True)
     last_scan_summary = Column(Text, nullable=True)
 
-# (SaaS-MVP) - encrypted connections + per-user settings (opsional dipakai nanti)
+# (SaaS-MVP) - encrypted connections + per-user settings
 def _fernet():
     key = hashlib.sha256(SECRET_KEY.encode()).digest()  # 32 bytes
     return Fernet(base64.urlsafe_b64encode(key))
@@ -143,11 +146,9 @@ KEYWORDS = [
     'bahkandilaguremix', 'bergabunglahdenganpulau777',
     '퓟퓤퓛퓐퓤퓦퓘퓝', '홿횄홻홰횄횆홸홽'
 ]
-KEYWORD_REGEX = re.compile("(" + "|".join(re.escape(k) for k in KEYWORDS) + ")", re.IGNORECASE)
 EXTRA_KEYWORDS = [k.strip() for k in os.getenv("EXTRA_KEYWORDS", "").split(",") if k.strip()]
 # gabungkan & hilangkan duplikat sambil mempertahankan urutan
 KEYWORDS = list(dict.fromkeys(KEYWORDS + EXTRA_KEYWORDS))
-
 # rebuild regex setelah KEYWORDS final
 KEYWORD_REGEX = re.compile("(" + "|".join(re.escape(k) for k in KEYWORDS) + ")", re.IGNORECASE)
 
@@ -213,7 +214,9 @@ def iter_comments(thread):
 
 def remove_comment(yt, cid: str):
     try:
-        yt.comments().setModerationStatus(id=cid, moderationStatus="rejected", banAuthor=bool(BAN_AUTHOR)).execute()
+        yt.comments().setModerationStatus(
+            id=cid, moderationStatus="rejected", banAuthor=bool(BAN_AUTHOR)
+        ).execute()
         return "rejected"
     except HttpError:
         try:
@@ -222,6 +225,46 @@ def remove_comment(yt, cid: str):
         except HttpError:
             yt.comments().delete(id=cid).execute()
             return "deleted"
+
+def do_scan_for_account(acc):
+    """Jalankan proses scan+hapus untuk 1 akun channel, return ringkasan (summary)."""
+    yt = yt_from_refresh(acc.refresh_token)
+
+    flagged = []
+    removed = {"rejected": 0, "marked_spam": 0, "deleted": 0, "errors": 0}
+    scanned = 0
+
+    # jelajah komentar
+    for thread in list_channel_threads(yt, acc.channel_id):
+        for cid, text, author, is_reply in iter_comments(thread):
+            scanned += 1
+            if is_spam(text):
+                item = {
+                    "comment_id": cid,
+                    "author": author,
+                    "text": text[:200],
+                    "is_reply": is_reply,
+                }
+                try:
+                    how = remove_comment(yt, cid)
+                    item["action"] = how
+                    removed[how] = removed.get(how, 0) + 1
+                except Exception as e:
+                    removed["errors"] += 1
+                    item["delete_error"] = str(e)
+                flagged.append(item)
+
+    summary = {
+        "channel_id": acc.channel_id,
+        "channel_title": acc.channel_title,
+        "scanned": scanned,
+        "flagged": len(flagged),
+        **removed,
+        "examples": flagged[:10],  # contoh untuk embed Discord
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "keywords_used": KEYWORDS,  # akan ikut termuat di dashboard
+    }
+    return summary
 
 def _truncate(s: str, n: int) -> str:
     s = s or ""
@@ -367,7 +410,6 @@ def oauth_callback():
     channel_id = items[0]["id"]
     channel_title = items[0]["snippet"]["title"]
 
-    from sqlalchemy import select
     with SessionLocal() as s:
         row = s.execute(select(Account).where(Account.channel_id == channel_id)).scalar_one_or_none()
         if row:
@@ -396,58 +438,25 @@ def logout():
 @app.post("/scan")
 @login_required
 def scan_my_channel():
-    acc_id = session["acc_id"]  # dijamin ada oleh @login_required
-
+    acc_id = session["acc_id"]  # sudah dijamin oleh @login_required
     with SessionLocal() as s:
         acc = s.get(Account, acc_id)
         if not acc:
             return jsonify({"error": "Account not found"}), 404
 
-        yt = yt_from_refresh(acc.refresh_token)
+        # 1) jalankan scan
+        summary = do_scan_for_account(acc)
 
-        flagged = []
-        removed = {"rejected": 0, "marked_spam": 0, "deleted": 0, "errors": 0}
-        scanned = 0
-
-        for thread in list_channel_threads(yt, acc.channel_id):
-            for cid, text, author, is_reply in iter_comments(thread):
-                scanned += 1
-                if is_spam(text):
-                    item = {
-                        "comment_id": cid,
-                        "author": author,
-                        "text": text[:200],
-                        "is_reply": is_reply,
-                    }
-                    try:
-                        how = remove_comment(yt, cid)
-                        item["action"] = how
-                        removed[how] = removed.get(how, 0) + 1
-                    except Exception as e:
-                        removed["errors"] += 1
-                        item["delete_error"] = str(e)
-                    flagged.append(item)
-
-        summary = {
-            "channel_id": acc.channel_id,
-            "channel_title": acc.channel_title,
-            "scanned": scanned,
-            "flagged": len(flagged),
-            **removed,
-            "examples": flagged[:10],
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "keywords_used": KEYWORDS,
-        }
-
-        # simpan hasil scan ke DB
+        # 2) simpan hasil ke DB
         acc.last_scan_at = datetime.utcnow()
         acc.last_scan_summary = json.dumps(summary)
         s.commit()
 
-    # (opsional) log ke Discord
+    # 3) (opsional) kirim notifikasi ke Discord di luar sesi DB
     _send_webhook(summary)
 
-    return jsonify(summary)
+    # 4) balas JSON ke browser
+    return jsonify(summary), 200
 
 # ========= debug =========
 @app.get("/debug/ping_webhook")
@@ -484,10 +493,6 @@ def debug_db_tables():
     except Exception as e:
         return jsonify({"error": type(e).__name__, "message": str(e)}), 500
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-    
 @app.get("/debug/keywords")
 def debug_keywords():
     return jsonify({
@@ -495,6 +500,9 @@ def debug_keywords():
         "keywords": KEYWORDS[:200]  # batasi output
     })
 
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
 # ========= dev server =========
 if __name__ == "__main__":
