@@ -15,27 +15,29 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
-from sqlalchemy.orm import sessionmaker, declarative_base
-# === imports tambahan untuk SaaS MVP ===
-from sqlalchemy import ForeignKey
-from sqlalchemy.orm import relationship
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, inspect
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from cryptography.fernet import Fernet
 import base64, hashlib
+
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from werkzeug.middleware.proxy_fix import ProxyFix
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+from functools import wraps
+
+# ========= app & config =========
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
+
 CRON_KEY = os.getenv("CRON_KEY", "change-this")
-BAN_AUTHOR = os.getenv("BAN_AUTHOR", "0") in ("1","true","True","yes","on")
+BAN_AUTHOR = os.getenv("BAN_AUTHOR", "0") in ("1", "true", "True", "yes", "on")
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "").strip()
-LOG_WEBHOOK_DEBUG = os.getenv("LOG_WEBHOOK_DEBUG", "0") in ("1","true","True","yes","on")
+LOG_WEBHOOK_DEBUG = os.getenv("LOG_WEBHOOK_DEBUG", "0") in ("1", "true", "True", "yes", "on")
 
 SCOPES = [
     "openid",
@@ -56,6 +58,7 @@ app.secret_key = SECRET_KEY
 app.config.update(PREFERRED_URL_SCHEME="https", SESSION_COOKIE_SECURE=True)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+# ========= models =========
 class Account(Base):
     __tablename__ = "accounts"
     id = Column(Integer, primary_key=True)
@@ -66,11 +69,10 @@ class Account(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_scan_at = Column(DateTime, nullable=True)
     last_scan_summary = Column(Text, nullable=True)
-# ======== MULTI-USER MODELS (SaaS MVP) ========
 
+# (SaaS-MVP) - encrypted connections + per-user settings (opsional dipakai nanti)
 def _fernet():
-    # turunkan SECRET_KEY jadi 32 bytes agar valid untuk Fernet
-    key = hashlib.sha256(SECRET_KEY.encode()).digest()
+    key = hashlib.sha256(SECRET_KEY.encode()).digest()  # 32 bytes
     return Fernet(base64.urlsafe_b64encode(key))
 
 class User(Base):
@@ -91,13 +93,12 @@ class Connection(Base):
     provider = Column(String(32), default="google")
     channel_id = Column(String(64), index=True)
     channel_title = Column(String(255))
-    refresh_token_enc = Column(Text)   # disimpan terenkripsi
+    refresh_token_enc = Column(Text)  # encrypted
     created_at = Column(DateTime, default=datetime.utcnow)
     last_scan_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="connections")
 
-    # helper simpan/ambil token terenkripsi
     def set_refresh_token(self, token: str):
         self.refresh_token_enc = _fernet().encrypt(token.encode()).decode()
 
@@ -116,28 +117,26 @@ class Setting(Base):
 
     user = relationship("User", back_populates="settings")
 
-# ======== END MULTI-USER MODELS ========
-
 Base.metadata.create_all(engine)
-# imports tambahan
-from functools import wraps
 
+# ========= helpers =========
 def db():
-    """Dapatkan sesi DB baru dari SessionLocal."""
+    """Get new DB session."""
     return SessionLocal()
 
 def login_required(fn):
-    """Proteksi route: wajib sudah login (punya session['uid'])."""
+    """Require login: must have session['acc_id']."""
     @wraps(fn)
     def _wrap(*a, **kw):
-        if "uid" not in session:
-            return redirect(url_for("index"))  # ganti 'index' kalau nama view-mu beda
+        if "acc_id" not in session:
+            return redirect(url_for("index"))
         return fn(*a, **kw)
     return _wrap
 
+# keywords spam
 KEYWORDS = [
     'pulau', 'pulauwin', 'pluto', 'plut088', 'pluto88', 'probet855',
-    'mona', 'mona4d', 'alexis17', 'istanabet17', 'mudahwin',
+    'mona', 'mona4d', 'alexis17', 'istanabet17', 'soundeffect', 'mudahwin',
     'akunpro', 'voli4d', 'maxwin', 'pulau777', 'weton88',
     'plutowin', 'plutowinn', 'pluto8', 'pulowin', 'pulauw', 'plu88',
     'pulautoto', 'tempatnyaparapemenangsejatiberkumpul',
@@ -197,7 +196,8 @@ def list_channel_threads(yt, channel_id: str, max_threads=300):
             if scanned >= max_threads:
                 return
         page_token = resp.get("nextPageToken")
-        if not page_token: break
+        if not page_token:
+            break
 
 def iter_comments(thread):
     top = thread["snippet"]["topLevelComment"]
@@ -226,33 +226,33 @@ def _discord_embed(summary: dict) -> dict:
     ch_id = summary.get("channel_id", "")
     url = f"https://www.youtube.com/channel/{ch_id}" if ch_id else None
     fields = [
-        {"name":"Scanned","value":str(summary.get("scanned",0)),"inline":True},
-        {"name":"Flagged","value":str(summary.get("flagged",0)),"inline":True},
-        {"name":"Rejected","value":str(summary.get("rejected",0)),"inline":True},
-        {"name":"Spam","value":str(summary.get("marked_spam",0)),"inline":True},
-        {"name":"Deleted","value":str(summary.get("deleted",0)),"inline":True},
-        {"name":"Errors","value":str(summary.get("errors",0)),"inline":True},
+        {"name": "Scanned", "value": str(summary.get("scanned", 0)), "inline": True},
+        {"name": "Flagged", "value": str(summary.get("flagged", 0)), "inline": True},
+        {"name": "Rejected", "value": str(summary.get("rejected", 0)), "inline": True},
+        {"name": "Spam", "value": str(summary.get("marked_spam", 0)), "inline": True},
+        {"name": "Deleted", "value": str(summary.get("deleted", 0)), "inline": True},
+        {"name": "Errors", "value": str(summary.get("errors", 0)), "inline": True},
     ]
     examples = summary.get("examples", [])[:3]
     if examples:
         ex_lines = []
         for ex in examples:
-            who = ex.get("author","anon")
-            text = _truncate(ex.get("text",""), 180)
-            action = ex.get("action","?")
+            who = ex.get("author", "anon")
+            text = _truncate(ex.get("text", ""), 180)
+            action = ex.get("action", "?")
             ex_lines.append(f"**{who}** — _{action}_\n{text}")
-        fields.append({"name":"Examples","value":_truncate("\n\n".join(ex_lines),1000),"inline":False})
+        fields.append({"name": "Examples", "value": _truncate("\n\n".join(ex_lines), 1000), "inline": False})
     kw = summary.get("keywords_used")
     if kw:
-        fields.append({"name":"Keywords","value":_truncate(", ".join(kw),1000),"inline":False})
+        fields.append({"name": "Keywords", "value": _truncate(", ".join(kw), 1000), "inline": False})
     return {
         "title": "Judiclean — Scan Result",
         "description": f"Channel: **{ch_title}**",
         "url": url,
-        "timestamp": datetime.utcnow().isoformat()+"Z",
-        "color": 0x2ecc71 if summary.get("errors",0)==0 else 0xe74c3c,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "color": 0x2ecc71 if summary.get("errors", 0) == 0 else 0xe74c3c,
         "fields": fields,
-        "footer": {"text":"Judiclean"},
+        "footer": {"text": "Judiclean"},
     }
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -261,16 +261,16 @@ def _post_json(url: str, payload: dict) -> dict:
         "Content-Type": "application/json",
         "Accept": "application/json",
         # Browser-like UA to avoid Cloudflare 1010
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36 Judiclean/1.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36 Judiclean/1.0",
     }
     req = Request(url, data=data, headers=headers)
     try:
         with urlopen(req, timeout=10) as r:
             status = r.getcode()
-            body = r.read()[:500].decode("utf-8","ignore")
+            body = r.read()[:500].decode("utf-8", "ignore")
     except HTTPError as e:
         status = e.code
-        body = e.read()[:500].decode("utf-8","ignore")
+        body = e.read()[:500].decode("utf-8", "ignore")
     except URLError as e:
         status = 0
         body = str(e)
@@ -280,37 +280,47 @@ def _post_json(url: str, payload: dict) -> dict:
 
 def _send_webhook(summary: dict):
     if not LOG_WEBHOOK_URL:
-        if LOG_WEBHOOK_DEBUG: print("[WEBHOOK] LOG_WEBHOOK_URL not set")
+        if LOG_WEBHOOK_DEBUG:
+            print("[WEBHOOK] LOG_WEBHOOK_URL not set")
         return
-    # prefer wait=true for JSON response
+
     url = LOG_WEBHOOK_URL
     if "wait=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}wait=true"
-    # try main domain first
-    resp = _post_json(url, {"content":"", "embeds":[_discord_embed(summary)], "allowed_mentions":{"parse":[]}})
-    # on Cloudflare 403 1010, try alternate discordapp.com domain and plain text fallback
+
+    resp = _post_json(url, {"content": "", "embeds": [_discord_embed(summary)], "allowed_mentions": {"parse": []}})
     if resp["status"] == 403 and "1010" in resp["body"]:
         alt = url.replace("https://discord.com", "https://discordapp.com")
-        resp2 = _post_json(alt, {"content":"", "embeds":[_discord_embed(summary)], "allowed_mentions":{"parse":[]}})
+        resp2 = _post_json(alt, {"content": "", "embeds": [_discord_embed(summary)], "allowed_mentions": {"parse": []}})
         if not (200 <= resp2["status"] < 300 or resp2["status"] == 204):
-            txt = f"Judiclean — {summary.get('channel_title')} | scanned={summary.get('scanned')} flagged={summary.get('flagged')} rejected={summary.get('rejected')} spam={summary.get('marked_spam')} deleted={summary.get('deleted')}"
-            _post_json(alt, {"content": txt, "allowed_mentions": {"parse":[]}})
+            txt = (
+                f"Judiclean — {summary.get('channel_title')} | "
+                f"scanned={summary.get('scanned')} flagged={summary.get('flagged')} "
+                f"rejected={summary.get('rejected')} spam={summary.get('marked_spam')} "
+                f"deleted={summary.get('deleted')}"
+            )
+            _post_json(alt, {"content": txt, "allowed_mentions": {"parse": []}})
     elif not (200 <= resp["status"] < 300 or resp["status"] == 204):
-        # generic fallback if not 403/1010
-        txt = f"Judiclean — {summary.get('channel_title')} | scanned={summary.get('scanned')} flagged={summary.get('flagged')} rejected={summary.get('rejected')} spam={summary.get('marked_spam')} deleted={summary.get('deleted')}"
-        _post_json(url, {"content": txt, "allowed_mentions": {"parse":[]}})
+        txt = (
+            f"Judiclean — {summary.get('channel_title')} | "
+            f"scanned={summary.get('scanned')} flagged={summary.get('flagged')} "
+            f"rejected={summary.get('rejected')} spam={summary.get('marked_spam')} "
+            f"deleted={summary.get('deleted')}"
+        )
+        _post_json(url, {"content": txt, "allowed_mentions": {"parse": []}})
 
+# ========= routes =========
 @app.get("/")
 def index():
     acc_id = session.get("acc_id")
     if not acc_id:
         return render_template("index.html")
-    with SessionLocal() as db:
-        acc = db.get(Account, acc_id)
+    with SessionLocal() as s:
+        acc = s.get(Account, acc_id)
         last = {}
         try:
-            last = json.loads(acc.last_scan_summary) if acc.last_scan_summary else {}
+            last = json.loads(acc.last_scan_summary) if acc and acc.last_scan_summary else {}
         except Exception:
             last = {}
         return render_template("dashboard.html", acc=acc, last=last)
@@ -318,7 +328,11 @@ def index():
 @app.get("/auth/login")
 def auth_login():
     flow = get_flow()
-    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
     session["state"] = state
     return redirect(auth_url)
 
@@ -330,6 +344,7 @@ def oauth_callback():
         creds = flow.credentials
     except Exception as e:
         return f"OAuth error while fetching token: {e}", 400
+
     try:
         refresh_token = creds.refresh_token
         if not refresh_token:
@@ -338,22 +353,33 @@ def oauth_callback():
         ch = yt.channels().list(part="id,snippet", mine=True).execute()
     except Exception as e:
         return f"YouTube API error: {e}", 400
+
     items = ch.get("items", [])
-    if not items: return "Tidak dapat mengambil channel dari akun ini.", 400
+    if not items:
+        return "Tidak dapat mengambil channel dari akun ini.", 400
+
     channel_id = items[0]["id"]
     channel_title = items[0]["snippet"]["title"]
+
     from sqlalchemy import select
-    with SessionLocal() as db:
-        row = db.execute(select(Account).where(Account.channel_id==channel_id)).scalar_one_or_none()
+    with SessionLocal() as s:
+        row = s.execute(select(Account).where(Account.channel_id == channel_id)).scalar_one_or_none()
         if row:
             row.channel_title = channel_title
             row.refresh_token = refresh_token
-            db.commit()
+            s.commit()
             acc = row
         else:
-            acc = Account(email="user", channel_id=channel_id, channel_title=channel_title, refresh_token=refresh_token)
-            db.add(acc); db.commit()
+            acc = Account(
+                email="user",
+                channel_id=channel_id,
+                channel_title=channel_title,
+                refresh_token=refresh_token,
+            )
+            s.add(acc)
+            s.commit()
         session["acc_id"] = acc.id
+
     return redirect(url_for("index"))
 
 @app.post("/logout")
@@ -364,10 +390,10 @@ def logout():
 @app.post("/scan")
 @login_required
 def scan_my_channel():
-    acc_id = session["acc_id"]  # sudah dijamin ada oleh @login_required
+    acc_id = session["acc_id"]  # dijamin ada oleh @login_required
 
-    with SessionLocal() as db:
-        acc = db.get(Account, acc_id)
+    with SessionLocal() as s:
+        acc = s.get(Account, acc_id)
         if not acc:
             return jsonify({"error": "Account not found"}), 404
 
@@ -410,13 +436,14 @@ def scan_my_channel():
         # simpan hasil scan ke DB
         acc.last_scan_at = datetime.utcnow()
         acc.last_scan_summary = json.dumps(summary)
-        db.commit()
+        s.commit()
 
-    # (opsional) kirim notifikasi ke Discord
+    # (opsional) log ke Discord
     _send_webhook(summary)
 
     return jsonify(summary)
 
+# ========= debug =========
 @app.get("/debug/ping_webhook")
 def debug_ping():
     demo = {
@@ -428,8 +455,8 @@ def debug_ping():
         "marked_spam": 0,
         "deleted": 0,
         "errors": 0,
-        "examples": [{"author":"spammer","text":"pluto88 maxwin","action":"rejected"}],
-        "ts": datetime.utcnow().isoformat()+"Z",
+        "examples": [{"author": "spammer", "text": "pluto88 maxwin", "action": "rejected"}],
+        "ts": datetime.utcnow().isoformat() + "Z",
         "keywords_used": KEYWORDS[:5],
     }
     _send_webhook(demo)
@@ -442,10 +469,8 @@ def debug_env():
         "LOG_WEBHOOK_DEBUG": LOG_WEBHOOK_DEBUG,
         "BAN_AUTHOR": BAN_AUTHOR,
     })
-# --- debug: lihat tabel di DB ---
-from sqlalchemy import inspect
 
-@app.route("/debug/db_tables", methods=["GET"])
+@app.get("/debug/db_tables")
 def debug_db_tables():
     try:
         insp = inspect(engine)
@@ -457,6 +482,7 @@ def debug_db_tables():
 def health():
     return jsonify({"ok": True})
 
+# ========= dev server =========
 if __name__ == "__main__":
     if os.getenv("ENV", "dev") == "dev":
         os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
